@@ -1,4 +1,4 @@
-# 🎵 Spotify → Discord Status
+#  Spotify → Discord Status
 
 Automatically sets your Discord custom status to the **current lyric line** of whatever you're listening to on Spotify — synced in real time, line by line.
 
@@ -28,7 +28,7 @@ You need **3 things** before running:
 
 ### 2. Discord token (your personal account token)
 
-> ⚠️ This is your **account** token, not a bot token. Keep it private — anyone with it can access your account.
+>  This is your **account** token, not a bot token. Keep it private — anyone with it can access your account.
 
 1. Open Discord in your **browser** (discord.com, not the app)
 2. Press `F12` to open DevTools
