@@ -5,6 +5,7 @@ import time
 import json
 import random
 import logging
+import threading
 
 import requests
 import spotipy
@@ -33,10 +34,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MAX_STATUS_LEN   = 128
-RESYNC_EVERY     = 30
-DRIFT_CHECK_EVERY = random.uniform(15, 20)
-DRIFT_THRESHOLD  = 2.5
+MAX_STATUS_LEN     = 128
+RESYNC_EVERY       = 12
 END_OF_SONG_WINDOW = 10
 END_OF_SONG_POLL   = 3
 
@@ -63,7 +62,6 @@ FIELDS = [
     ("SPOTIPY_CLIENT_ID",     "Spotify Client ID"),
     ("SPOTIPY_CLIENT_SECRET", "Spotify Client Secret"),
     ("SPOTIPY_REDIRECT_URI",  "Spotify Redirect URI"),
-    ("GENIUS_ACCESS_TOKEN",   "Genius Access Token (optional, fallback lyrics)"),
     ("DISCORD_TOKEN",         "Discord User Token"),
 ]
 
@@ -75,167 +73,86 @@ def fmt_time(seconds: float) -> str:
     s = int(seconds) % 60
     return f"{m}:{s:02d}"
 
-def print_status(
-    song: str,
-    artist: str,
-    progress_s: float,
-    duration_s: float,
-    current_line: str,
-    source: str,
-    discord_ok: bool,
-):
+EMOJI_WIDE = re.compile(
+    "[\U00010000-\U0010ffff"
+    "\U0001F300-\U0001F9FF"
+    "\U00002600-\U000027BF"
+    "\U0000FE00-\U0000FE0F"
+    "\U00020000-\U0002A6DF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+def vis_len(s: str) -> int:
+    return len(s) + len(EMOJI_WIDE.findall(s))
+
+def pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - vis_len(s))
+
+def row(content: str, W: int) -> str:
+    return "║ " + pad(content, W - 2) + " ║"
+
+def print_status(song, artist, progress_s, duration_s, current_line, source, discord_ok):
     clear_screen()
-    W = 54
-    bar_width = W - 2
-    filled = int((progress_s / max(duration_s, 1)) * bar_width)
-    bar = "█" * filled + "░" * (bar_width - filled)
+    W        = 52
+    bar_w    = W - 6
+    filled   = int((progress_s / max(duration_s, 1)) * bar_w)
+    bar      = "█" * filled + "░" * (bar_w - filled)
+    prog_str = f"{fmt_time(progress_s)} / {fmt_time(duration_s)}"
+    status   = "✓ Updated" if discord_ok else "✗ Failed"
+
+    div  = "╠" + "═" * W + "╣"
+    song_t   = song[:W - 12]   if song   else ""
+    artist_t = artist[:W - 12] if artist else ""
+    line_t   = current_line[:W - 4] if current_line else "—"
 
     print("╔" + "═" * W + "╗")
-    print(f"║  🎵  Spotify → Discord Status{' ' * (W - 29)}║")
-    print("╠" + "═" * W + "╣")
-    print(f"║  Song:     {song[:W-13]:<{W-13}}║")
-    print(f"║  Author:   {artist[:W-13]:<{W-13}}║")
-    print("║" + " " * W + "║")
-    print(f"║  [{bar}]  ║")
-    prog_str = f"{fmt_time(progress_s)} / {fmt_time(duration_s)}"
-    print(f"║  {prog_str:<{W-2}}║")
-    print("╠" + "═" * W + "╣")
-    line_display = current_line[:W-4] if current_line else "—"
-    print(f"║  ❝ {line_display:<{W-4}}║")
-    print("╠" + "═" * W + "╣")
-    src_str   = f"  Lyrics source : {source}"
-    disc_str  = f"  Discord status: {'✓ Updated' if discord_ok else '✗ Failed'}"
-    print(f"║{src_str:<{W}}║")
-    print(f"║{disc_str:<{W}}║")
-    print("╠" + "═" * W + "╣")
-    print(f"║  Press Ctrl+C to stop{' ' * (W - 21)}║")
+    print(row("🎵  Spotify → Discord Status", W))
+    print(div)
+    print(row(f"Song    {song_t}", W))
+    print(row(f"Artist  {artist_t}", W))
+    print(row("", W))
+    print(row(f"  [{bar}]", W))
+    print(row(f"  {prog_str}", W))
+    print(div)
+    print(row(f"  {line_t}", W))
+    print(div)
+    print(row(f"  Source  {source}", W))
+    print(row(f"  Discord {status}", W))
+    print(div)
+    print(row("  Ctrl+C to stop", W))
     print("╚" + "═" * W + "╝")
 
-def set_discord_status(token: str, text: str, emoji: str = "🎵") -> bool:
-    url     = "https://discord.com/api/v9/users/@me/settings"
-    headers = {"Authorization": token, "Content-Type": "application/json"}
-    payload = {"custom_status": {"text": text[:MAX_STATUS_LEN], "emoji_name": emoji}}
-    try:
-        resp = requests.patch(url, json=payload, headers=headers, timeout=10)
-        return resp.status_code == 200
-    except requests.RequestException:
-        return False
-
-def clear_discord_status(token: str):
-    url     = "https://discord.com/api/v9/users/@me/settings"
-    headers = {"Authorization": token, "Content-Type": "application/json"}
-    try:
-        requests.patch(url, json={"custom_status": None}, headers=headers, timeout=10)
-    except requests.RequestException:
-        pass
-
-def parse_lrc(lrc_text: str) -> list[tuple[float, str]]:
-    pattern = re.compile(r"\[(\d+):(\d+\.\d+)\](.*)")
-    result  = []
-    for match in pattern.finditer(lrc_text):
-        minutes  = int(match.group(1))
-        seconds  = float(match.group(2))
-        text     = match.group(3).strip()
-        if text:
-            result.append((minutes * 60 + seconds, text))
-    return sorted(result, key=lambda x: x[0])
-
-def fetch_lyrics_lrclib(artist: str, title: str, duration_s: float) -> list[tuple[float, str]] | None:
-    try:
-        resp = requests.get(
-            "https://lrclib.net/api/get",
-            params={
-                "artist_name": artist,
-                "track_name":  title,
-                "duration":    int(duration_s),
-            },
-            timeout=10,
-            headers={"User-Agent": "SpotifyDiscordStatus/1.0"},
-        )
-        if resp.status_code != 200:
-            return None
-        data     = resp.json()
-        lrc_text = data.get("syncedLyrics") or data.get("plainLyrics")
-        if not lrc_text:
-            return None
-        if data.get("syncedLyrics"):
-            return parse_lrc(lrc_text)
-        lines = [l.strip() for l in lrc_text.splitlines() if l.strip()]
-        time_per = duration_s / max(len(lines), 1)
-        return [(i * time_per, l) for i, l in enumerate(lines)]
-    except Exception as exc:
-        log.warning("LrcLib error: %s", exc)
-        return None
-
-def fetch_lyrics_genius(genius_token: str, artist: str, title: str, duration_s: float) -> list[tuple[float, str]] | None:
-    if not genius_token:
-        return None
-    headers = {"Authorization": f"Bearer {genius_token}"}
-    try:
-        resp = requests.get(
-            "https://api.genius.com/search",
-            params={"q": f"{title} {artist}"},
-            headers=headers,
-            timeout=10,
-        )
-        hits = resp.json().get("response", {}).get("hits", [])
-        if not hits:
-            return None
-        song_url = hits[0]["result"]["url"]
-        page     = requests.get(song_url, timeout=10)
-        raw      = re.findall(r'data-lyrics-container="true"[^>]*>(.*?)</div>', page.text, re.DOTALL)
-        if not raw:
-            return None
-        text = " ".join(raw)
-        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", "", text)
-        text = re.sub(r"\[.*?\]", "", text)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        lines    = [l.strip() for l in text.splitlines() if l.strip()]
-        time_per = duration_s / max(len(lines), 1)
-        return [(i * time_per, l) for i, l in enumerate(lines)]
-    except Exception as exc:
-        log.warning("Genius error: %s", exc)
-        return None
-
-def detect_mood(timed_lines: list[tuple[float, str]]) -> str:
-    text   = " ".join(l for _, l in timed_lines).lower()
-    scores = {mood: sum(text.count(kw) for kw in kws) for mood, kws in MOOD_KEYWORDS.items()}
-    best   = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "neutral"
-
-def line_index_at(timed_lines: list[tuple[float, str]], pos_s: float) -> int:
-    idx = 0
-    for i, (start, _) in enumerate(timed_lines):
-        if start <= pos_s:
-            idx = i
-        else:
-            break
-    return idx
-
-def mask(value: str) -> str:
-    if not value:
-        return "(not set)"
-    if len(value) <= 12:
-        return "*" * len(value)
-    return value[:6] + "*" * (len(value) - 10) + value[-4:]
+def main_menu() -> str:
+    clear_screen()
+    W = 36
+    print("╔" + "═" * W + "╗")
+    print(row("🎵  Spotify → Discord Status", W))
+    print("╠" + "═" * W + "╣")
+    print(row("  [1]  Start", W))
+    print(row("  [2]  Settings", W))
+    print(row("  [3]  Exit", W))
+    print("╚" + "═" * W + "╝")
+    return input("\n  > ").strip()
 
 def config_menu() -> dict:
     cfg = load_config()
     while True:
         clear_screen()
-        print("╔" + "═" * 52 + "╗")
-        print("║  ⚙  Settings" + " " * 39 + "║")
-        print("╠" + "═" * 52 + "╣")
+        W = 52
+        print("╔" + "═" * W + "╗")
+        print(row("⚙   Settings", W))
+        print("╠" + "═" * W + "╣")
         for i, (key, label) in enumerate(FIELDS, 1):
             val_str = mask(cfg.get(key, ""))
-            print(f"║  [{i}] {label:<35}║")
-            print(f"║      {val_str:<46}║")
-            print("║" + " " * 52 + "║")
-        print("║  [A] Update ALL" + " " * 36 + "║")
-        print("║  [B] Back" + " " * 42 + "║")
-        print("╚" + "═" * 52 + "╝")
-        choice = input("\n  Choice: ").strip().upper()
+            print(row(f"  [{i}]  {label}", W))
+            print(row(f"        {val_str}", W))
+            print(row("", W))
+        print("╠" + "═" * W + "╣")
+        print(row("  [A]  Update all", W))
+        print(row("  [B]  Back", W))
+        print("╚" + "═" * W + "╝")
+        choice = input("\n  > ").strip().upper()
 
         if choice == "B":
             break
@@ -269,16 +186,147 @@ def config_menu() -> dict:
 
     return load_config()
 
-def main_menu() -> str:
-    clear_screen()
-    print("╔" + "═" * 38 + "╗")
-    print("║  🎵  Spotify → Discord Status     ║")
-    print("╠" + "═" * 38 + "╣")
-    print("║  [1] Start                        ║")
-    print("║  [2] Settings                     ║")
-    print("║  [3] Exit                         ║")
-    print("╚" + "═" * 38 + "╝")
-    return input("\n  Choice: ").strip()
+def set_discord_status(token: str, text: str, emoji: str = "🎵") -> bool:
+    url     = "https://discord.com/api/v9/users/@me/settings"
+    headers = {"Authorization": token, "Content-Type": "application/json"}
+    payload = {"custom_status": {"text": text[:MAX_STATUS_LEN], "emoji_name": emoji}}
+    try:
+        resp = requests.patch(url, json=payload, headers=headers, timeout=10)
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+def clear_discord_status(token: str):
+    url     = "https://discord.com/api/v9/users/@me/settings"
+    headers = {"Authorization": token, "Content-Type": "application/json"}
+    try:
+        requests.patch(url, json={"custom_status": None}, headers=headers, timeout=10)
+    except requests.RequestException:
+        pass
+
+def parse_lrc(lrc_text: str) -> list[tuple[float, str]]:
+    pattern = re.compile(r"\[(\d+):(\d+\.\d+)\](.*)")
+    result  = []
+    for match in pattern.finditer(lrc_text):
+        minutes = int(match.group(1))
+        seconds = float(match.group(2))
+        text    = match.group(3).strip()
+        if text:
+            result.append((minutes * 60 + seconds, text))
+    return sorted(result, key=lambda x: x[0])
+
+_lyrics_cache: dict[str, tuple] = {}
+_cache_lock = threading.Lock()
+
+def _lrclib_parse_response(data: dict, duration_s: float) -> list[tuple[float, str]] | None:
+    lrc_text = data.get("syncedLyrics") or data.get("plainLyrics")
+    if not lrc_text:
+        return None
+    if data.get("syncedLyrics"):
+        return parse_lrc(lrc_text)
+    lines    = [l.strip() for l in lrc_text.splitlines() if l.strip()]
+    time_per = duration_s / max(len(lines), 1)
+    return [(i * time_per, l) for i, l in enumerate(lines)]
+
+def _clean_title(title: str) -> str:
+    title = re.sub(r"\(feat\..*?\)", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\(ft\..*?\)", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\(with.*?\)", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\(remaster.*?\)", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\(.*?version.*?\)", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\[.*?\]", "", title)
+    return title.strip()
+
+def fetch_lyrics_lrclib(artist: str, title: str, duration_s: float) -> tuple[list[tuple[float, str]], bool] | tuple[None, None]:
+    headers = {"User-Agent": "SpotifyDiscordStatus/1.0"}
+    clean   = _clean_title(title)
+
+    get_attempts = [
+        {"artist_name": artist, "track_name": title,  "duration": int(duration_s)},
+        {"artist_name": artist, "track_name": title},
+        {"artist_name": artist, "track_name": clean,  "duration": int(duration_s)},
+        {"artist_name": artist, "track_name": clean},
+    ]
+    for params in get_attempts:
+        try:
+            resp = requests.get("https://lrclib.net/api/get", params=params, timeout=8, headers=headers)
+            if resp.status_code == 200:
+                data   = resp.json()
+                synced = bool(data.get("syncedLyrics"))
+                result = _lrclib_parse_response(data, duration_s)
+                if result:
+                    log.info("LrcLib /get matched %s | synced=%s", params, synced)
+                    return result, synced
+        except Exception as exc:
+            log.warning("LrcLib /get %s error: %s", params, exc)
+
+    search_attempts = [
+        {"artist_name": artist, "track_name": title},
+        {"artist_name": artist, "track_name": clean},
+        {"q": f"{artist} {clean}"},
+    ]
+    for params in search_attempts:
+        try:
+            resp = requests.get("https://lrclib.net/api/search", params=params, timeout=8, headers=headers)
+            if resp.status_code == 200:
+                hits = resp.json()
+                if isinstance(hits, list):
+                    for hit in hits[:3]:
+                        synced = bool(hit.get("syncedLyrics"))
+                        result = _lrclib_parse_response(hit, duration_s)
+                        if result:
+                            log.info("LrcLib /search matched %s | synced=%s", params, synced)
+                            return result, synced
+        except Exception as exc:
+            log.warning("LrcLib /search %s error: %s", params, exc)
+
+    return None, None
+
+def fetch_and_cache(track_id: str, artist: str, title: str, duration_s: float):
+    with _cache_lock:
+        if track_id in _lyrics_cache:
+            return
+
+    result, synced = fetch_lyrics_lrclib(artist, title, duration_s)
+    if result and synced:
+        src, raw_lines = "LrcLib (synced)", None
+    elif result:
+        src, raw_lines = "LrcLib (plain)", None
+    else:
+        src, raw_lines, result = "None (track name only)", None, None
+
+    mood = detect_mood(result if result else []) if result else "neutral"
+
+    with _cache_lock:
+        _lyrics_cache[track_id] = (result, src, mood, raw_lines)
+        if len(_lyrics_cache) > 10:
+            oldest = next(iter(_lyrics_cache))
+            del _lyrics_cache[oldest]
+
+    log.info("Cached: %s – %s | Source: %s", artist, title, src)
+
+def detect_mood(timed_lines: list[tuple[float, str]]) -> str:
+    text   = " ".join(l for _, l in timed_lines).lower()
+    scores = {mood: sum(text.count(kw) for kw in kws) for mood, kws in MOOD_KEYWORDS.items()}
+    best   = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "neutral"
+
+def line_index_at(timed_lines: list[tuple[float, str]], pos_s: float) -> int:
+    idx = 0
+    for i, (start, _) in enumerate(timed_lines):
+        if start <= pos_s:
+            idx = i
+        else:
+            break
+    return idx
+
+def mask(value: str) -> str:
+    if not value:
+        return "(not set)"
+    if len(value) <= 12:
+        return "*" * len(value)
+    return value[:6] + "*" * (len(value) - 10) + value[-4:]
+
 
 def run(cfg: dict):
     required = {"SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "DISCORD_TOKEN"}
@@ -295,7 +343,7 @@ def run(cfg: dict):
             client_id=cfg["SPOTIPY_CLIENT_ID"],
             client_secret=cfg["SPOTIPY_CLIENT_SECRET"],
             redirect_uri=redirect,
-            scope="user-read-currently-playing user-read-playback-state",
+            scope="user-read-currently-playing user-read-playback-state user-read-recently-played",
         )
         sp = spotipy.Spotify(auth_manager=auth)
     except Exception as exc:
@@ -304,24 +352,24 @@ def run(cfg: dict):
         return
 
     discord_token = cfg["DISCORD_TOKEN"]
-    genius_token  = cfg.get("GENIUS_ACCESS_TOKEN", "")
 
-    last_track_id   = None
-    timed_lines     = []
-    lyrics_source   = "—"
-    mood            = "neutral"
-    current_idx     = -1
-    last_resync     = 0.0
-    anchor_pos_s    = 0.0
-    anchor_time     = time.monotonic()
-    discord_ok      = False
-    last_drift_check = 0.0
+    last_track_id       = None
+    timed_lines         = []
+    lyrics_source       = "—"
+    mood                = "neutral"
+    current_idx         = -1
+    last_resync         = 0.0
+    anchor_pos_s        = 0.0
+    anchor_time         = time.monotonic()
+    discord_ok          = False
+    last_drift_check    = 0.0
     next_drift_interval = random.uniform(15, 20)
+    plain_raw          = None
 
-    ui_song        = ""
-    ui_artist      = ""
-    ui_duration_s  = 0.0
-    ui_line        = ""
+    ui_song       = ""
+    ui_artist     = ""
+    ui_duration_s = 0.0
+    ui_line       = ""
 
     def do_spotify_poll() -> dict | None:
         try:
@@ -330,39 +378,87 @@ def run(cfg: dict):
             log.error("Spotify poll: %s", exc)
             return None
 
-    def load_new_track(track_id, track_name, artist_name, duration_s):
+    def anchor_plain(raw_lines: list[str], duration_s: float, pos_s: float) -> list[tuple[float, str]]:
+        if not raw_lines:
+            return []
+        time_per  = duration_s / len(raw_lines)
+        timed     = [(i * time_per, l) for i, l in enumerate(raw_lines)]
+        start_idx = line_index_at(timed, pos_s)
+        offset    = pos_s - timed[start_idx][0]
+        return [(t + offset, l) for t, l in timed]
+
+    def load_new_track(track_id, track_name, artist_name, duration_s, start_pos_s):
         nonlocal ui_line
-        ui_line = "Fetching lyrics..."
-        clear_screen()
-        print(f"  ♫  {track_name} — {artist_name}")
-        print("  Fetching lyrics from LrcLib...")
 
-        result = fetch_lyrics_lrclib(artist_name, track_name, duration_s)
-        if result:
-            src = "LrcLib (synced)" if result[0][0] > 0 else "LrcLib (plain)"
+        with _cache_lock:
+            cached = _lyrics_cache.get(track_id)
+
+        if cached:
+            result, src, m, raw_lines = cached
+            src = f"{src} (prefetched)"
+            log.info("Cache hit: %s – %s", artist_name, track_name)
         else:
-            print("  LrcLib failed, trying Genius...")
-            result = fetch_lyrics_genius(genius_token, artist_name, track_name, duration_s)
-            src = "Genius (estimated)" if result else "None (track name only)"
-            if not result:
-                result = []
+            ui_line = "Fetching lyrics..."
+            print(f"  ♫  {track_name} — {artist_name}")
+            print("  Fetching lyrics from LrcLib...")
+            t = threading.Thread(
+                target=fetch_and_cache,
+                args=(track_id, artist_name, track_name, duration_s),
+                daemon=True,
+            )
+            t.start()
+            t.join(timeout=20)
+            with _cache_lock:
+                result, src, m, raw_lines = _lyrics_cache.get(track_id, (None, "None (track name only)", "neutral", None))
 
-        m = detect_mood(result) if result else "neutral"
-        log.info("Now playing: %s – %s | Source: %s | Lines: %d | Mood: %s",
-                 artist_name, track_name, src, len(result), m)
-        return result, src, m
+        if result is None and raw_lines:
+            result = anchor_plain(raw_lines, duration_s, start_pos_s)
+            src    = f"{src} (anchored)"
+
+        if not result:
+            result = []
+
+        start_idx = line_index_at(result, start_pos_s) if result else -1
+        log.info(
+            "Now playing: %s – %s | Source: %s | Lines: %d | Mood: %s | Starting at line %d (%.1fs)",
+            artist_name, track_name, src, len(result), m, start_idx, start_pos_s,
+        )
+        return result, src, m, start_idx, raw_lines
+
+    def prefetch_queue():
+        try:
+            queue_data = sp.queue()
+            if not queue_data:
+                return
+            upcoming = queue_data.get("queue", [])
+            if not upcoming:
+                return
+            next_track = upcoming[0]
+            nid     = next_track["id"]
+            nname   = next_track["name"]
+            nartist = next_track["artists"][0]["name"]
+            ndur    = next_track["duration_ms"] / 1000
+
+            with _cache_lock:
+                already = nid in _lyrics_cache
+            if not already:
+                log.info("Prefetching next track: %s – %s", nartist, nname)
+                t = threading.Thread(
+                    target=fetch_and_cache,
+                    args=(nid, nartist, nname, ndur),
+                    daemon=True,
+                )
+                t.start()
+        except Exception as exc:
+            log.warning("Prefetch queue error: %s", exc)
 
     try:
         while True:
             pos_s = anchor_pos_s + (time.monotonic() - anchor_time)
 
-            near_end = (
-                ui_duration_s > 0
-                and pos_s >= ui_duration_s - END_OF_SONG_WINDOW
-            )
-            poll_interval = END_OF_SONG_POLL if near_end else RESYNC_EVERY
-            time_since_resync = time.monotonic() - last_resync
-            need_poll = last_track_id is None or time_since_resync >= poll_interval
+            near_end      = ui_duration_s > 0 and pos_s >= ui_duration_s - END_OF_SONG_WINDOW
+            poll_interval = END_OF_SONG_POLL if near_end else random.uniform(10, 15)
+            need_poll     = last_track_id is None or (time.monotonic() - last_resync) >= poll_interval
 
             if need_poll:
                 playback = do_spotify_poll()
@@ -399,17 +495,45 @@ def run(cfg: dict):
 
                 if track_id != last_track_id:
                     last_track_id       = track_id
-                    current_idx         = -1
                     last_drift_check    = time.monotonic()
                     next_drift_interval = random.uniform(15, 20)
-                    timed_lines, lyrics_source, mood = load_new_track(
-                        track_id, track_name, artist_name, duration_s
+
+                    start_pos_s = progress_ms / 1000
+                    timed_lines, lyrics_source, mood, current_idx, plain_raw = load_new_track(
+                        track_id, track_name, artist_name, duration_s, start_pos_s
                     )
+
+                    if timed_lines and current_idx >= 0:
+                        _, line    = timed_lines[current_idx]
+                        ui_line    = line
+                        emoji      = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
+                        discord_ok = set_discord_status(discord_token, line, emoji)
+                        log.info("Started at line %d: %s", current_idx, line)
+                    elif not timed_lines:
+                        fallback    = f"{track_name} — {artist_name}"
+                        ui_line     = fallback
+                        discord_ok  = set_discord_status(discord_token, fallback)
+                        current_idx = 0
+
+                    prefetch_queue()
+
+                else:
+                    if plain_raw:
+                        real_pos_s  = progress_ms / 1000
+                        timed_lines = anchor_plain(plain_raw, duration_s, real_pos_s)
+                        new_idx     = line_index_at(timed_lines, real_pos_s)
+                        if new_idx != current_idx:
+                            current_idx = new_idx
+                            _, line     = timed_lines[current_idx]
+                            ui_line     = line
+                            emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
+                            discord_ok  = set_discord_status(discord_token, line, emoji)
+                            log.info("Plain re-anchored at %.1fs → line %d: %s", real_pos_s, current_idx, line)
 
                 anchor_pos_s = progress_ms / 1000
                 anchor_time  = time.monotonic()
                 last_resync  = time.monotonic()
-                pos_s = anchor_pos_s
+                pos_s        = anchor_pos_s
 
             if (timed_lines
                     and current_idx >= 0
@@ -417,10 +541,7 @@ def run(cfg: dict):
 
                 expected_idx = line_index_at(timed_lines, pos_s)
                 if expected_idx != current_idx:
-                    log.info(
-                        "Drift corrected: line %d → %d at %.1fs",
-                        current_idx, expected_idx, pos_s,
-                    )
+                    log.info("Drift corrected: line %d → %d at %.1fs", current_idx, expected_idx, pos_s)
                     current_idx = expected_idx
                     _, line     = timed_lines[current_idx]
                     ui_line     = line
@@ -439,12 +560,6 @@ def run(cfg: dict):
                     emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
                     discord_ok  = set_discord_status(discord_token, line, emoji)
                     log.info("Line %d: %s", current_idx, line)
-            else:
-                if current_idx == -1:
-                    fallback    = f"{ui_song} — {ui_artist}"
-                    ui_line     = fallback
-                    discord_ok  = set_discord_status(discord_token, fallback)
-                    current_idx = 0
 
             print_status(
                 song         = ui_song,
@@ -456,7 +571,7 @@ def run(cfg: dict):
                 discord_ok   = discord_ok,
             )
 
-            pos_s = anchor_pos_s + (time.monotonic() - anchor_time)
+            pos_s      = anchor_pos_s + (time.monotonic() - anchor_time)
             candidates = []
 
             if timed_lines and current_idx + 1 < len(timed_lines):
@@ -464,16 +579,15 @@ def run(cfg: dict):
                 if next_line_in > 0:
                     candidates.append(next_line_in)
 
-            next_poll_in = poll_interval - (time.monotonic() - last_resync)
-            candidates.append(max(0.1, next_poll_in))
-
+            next_poll_in  = poll_interval - (time.monotonic() - last_resync)
             next_drift_in = next_drift_interval - (time.monotonic() - last_drift_check)
+            candidates.append(max(0.1, next_poll_in))
             candidates.append(max(0.1, next_drift_in))
 
             sleep_s = min(candidates) if candidates else 2.0
-
             if near_end:
                 sleep_s = min(sleep_s, END_OF_SONG_POLL)
+
             time.sleep(sleep_s)
 
     except KeyboardInterrupt:
