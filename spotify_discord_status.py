@@ -3,18 +3,28 @@ import re
 import sys
 import time
 import json
+import queue
 import random
 import logging
 import threading
+import textwrap
+import unicodedata
 
 import requests
 import spotipy
 import syncedlyrics as synced_lib
 from spotipy.oauth2 import SpotifyOAuth
 
+def get_appdata_dir() -> str:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+    path = os.path.join(appdata, "SpotifyDiscordStatus")
+    os.makedirs(path, exist_ok=True)
+    return path
+
 def config_path() -> str:
-    base = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
-    return os.path.join(base, "config.json")
+    return os.path.join(get_appdata_dir(), "config.json")
 
 def load_config() -> dict:
     try:
@@ -26,20 +36,23 @@ def load_config() -> dict:
 def save_config(cfg: dict):
     with open(config_path(), "w") as f:
         json.dump(cfg, f, indent=2)
-    print(f"  ✓ Saved to {config_path()}")
+    print(f"  Saved to {config_path()}")
 
 logging.basicConfig(
-    filename="spotify_discord.log",
+    filename=os.path.join(get_appdata_dir(), "spotify_discord.log"),
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
 )
 log = logging.getLogger(__name__)
 
+
+
+
 MAX_STATUS_LEN     = 128
-RESYNC_EVERY       = 12
+RESYNC_EVERY       = 5.0
 END_OF_SONG_WINDOW = 10
 END_OF_SONG_POLL   = 3
-SEEK_THRESHOLD     = 3.0   # seconds – detect manual seek if drift exceeds this
+SEEK_THRESHOLD     = 3.0
 
 MOOD_EMOJI = {
     "happy":    ["😄", "✨", "🌟", "🎉", "🥳"],
@@ -68,95 +81,309 @@ FIELDS = [
 ]
 
 def clear_screen():
-    os.system("cls" if os.name == "nt" else "clear")
+    sys.stdout.write("\033[H\033[J")
+    sys.stdout.flush()
 
 def fmt_time(seconds: float) -> str:
     m = int(seconds) // 60
     s = int(seconds) % 60
     return f"{m}:{s:02d}"
 
-EMOJI_WIDE = re.compile(
-    "[\U00010000-\U0010ffff"
-    "\U0001F300-\U0001F9FF"
-    "\U00002600-\U000027BF"
-    "\U0000FE00-\U0000FE0F"
-    "\U00020000-\U0002A6DF"
-    "]+",
-    flags=re.UNICODE,
-)
+def display_len(s: str) -> int:
+    if not s:
+        return 0
+    w = 0
+    for c in s:
+        if unicodedata.category(c) == 'Mn' or c in ('\u200d', '\ufe0f'):
+            continue
+        if unicodedata.east_asian_width(c) in ('W', 'F', 'A') or (0x1f000 <= ord(c) <= 0x1faff) or (0x2600 <= ord(c) <= 0x27bf):
+            w += 2
+        else:
+            w += 1
+    return w
 
-def vis_len(s: str) -> int:
-    return len(s) + len(EMOJI_WIDE.findall(s))
+def trim_display(s: str, width: int) -> str:
+    s = s or ""
+    if display_len(s) <= width:
+        return s
+    limit = max(0, width - 3)
+    trimmed = ""
+    for c in s:
+        if display_len(trimmed + c) > limit:
+            break
+        trimmed += c
+    return trimmed + "..."
 
 def pad(s: str, width: int) -> str:
-    return s + " " * max(0, width - vis_len(s))
+    s = trim_display(s, width)
+    return s + " " * max(0, width - display_len(s))
 
 def row(content: str, W: int) -> str:
-    return "║ " + pad(content, W - 2) + " ║"
+    return "| " + pad(content, W - 2) + " |"
+
+def border(W: int, char: str = "-") -> str:
+    return "+" + char * W + "+"
+
+PIKES = [
+    ("Cunning Pike", r"""
+  |
+-O_O-
+"""),
+    ("King Cunning Pike", r"""
+  W
+-O_O-
+"""),
+    ("Queen Cunning Pike", r"""
+  +
+-O_O-
+"""),
+    ("Cunning Pike Winking", r"""
+  |
+-O_--
+"""),
+    ("Cunning Pike Sleeping", r"""
+   |
+- -_- -
+"""),
+    ("Cow Trying To Be A Cunning Pike", r"""
+ (  )
+--OO--
+"""),
+    ("Cunning Pike Hiding Behind Weeds", r"""
+} { }
+{{ }_O-
+ }{
+ {
+"""),
+    ("Shocked Cunning Pike", r"""
+  |
+-O O-
+  o
+"""),
+    ("Cunning Pike With Necklace", r"""
+  |
+-O_O-
+ \o/
+"""),
+    ("Cunning Cyclops Pike", r"""
+   |
+--(O)--
+"""),
+    ("Cunning Pike Having Seen Nuclear Sub", r"""
+  |
+-@_@-
+"""),
+    ("Cunning Pike Having Taken Something Illegal", r"""
+  |
+-X X-
+  ~
+"""),
+    ("Vibrating Cunning Pike", r"""
+  |  |   |   |  |
+-( -(  -O_O-  )- )-
+"""),
+    ("Synchronised Swimming Pikes", r"""
+      |
+    -O_O-
+  |       |
+-O_O-   -O_O-
+      |
+    -O_O-
+"""),
+    ("Cunning Pike With Monocle", r"""
+  |
+-O_q-
+"""),
+    ("Cunning Pike On Skateboard", r"""
+ --      |
+  --   -O_O-
+--   ==========
+      O      O
+"""),
+    ("Limbo Dancing Cunning Pike", r"""
+____|____
+| -O_O- |
+"""),
+    ("Acrobatic Cunning Pikes", r"""
+__________________
+|     |    |     |
+|  |  |    |     |
+|-O_O-|    |     |
+           |  |  |
+           |-O_O-|
+"""),
+    ("Cunning Pike On Stilts", r"""
+  |
+-O_O-
+ | |
+ | |
+ | |
+ | |
+ ^ ^
+"""),
+    ("Cunning Pike Doing The High Dive", r"""
+       --------------|
+    |   |            |
+                     |
+      |              |
+    -O_O-            |
+~~~~~~~~~~~~~~~~~~~~~
+"""),
+    ("A School Of Cunning Pikes", r"""
+     ____     ___________
+      |  *   |  Pikes R  |
+    -O_O---  | Cunning ! |
+             |___________|
+   |     |     |
+ -(|)- -(|)- -(|)-
+"""),
+    ("Cunning Pike Wallpaper", r"""
+  _   _   _   _
+-O_O-O_O-O_O-O_O-
+-O_O-O_O-O_O-O_O-
+-O_O-O_O-O_O-O_O-
+"""),
+    ("James Pond", r"""
+  |
+-0_0-7
+"""),
+    ("Cunning Pike Pole Vaulting", r"""
+         /|
+  |     | |
+-O_O-|  | |
+     |  | |
+     |  | |_______________
+     |  |_/_____________/ |
+     |  |_______________|/
+"""),
+    ("Cunning Pike Disguised As Spider", r"""
+  |
+  |
+\ | /
+-O_O-
+/ | \
+"""),
+]
+
+
+def clean_art_lines(art: str) -> list[str]:
+    return [line.rstrip() for line in art.strip("\n").splitlines()]
+
+
+def pike_index(seed: str) -> int:
+    seed = seed or "idle"
+    return sum(ord(ch) for ch in seed) % len(PIKES)
+
+
+def pike_panel(seed: str, speech: str, listening: bool) -> list[str]:
+    name, art = PIKES[pike_index(seed)]
+    bubble_width = 34
+    if not listening:
+        speech = "hi" if int(time.time() / 4) % 2 else "hey"
+    words = textwrap.wrap(
+        speech or "hi",
+        width=bubble_width,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )[:3] or ["hi"]
+
+    lines = [" ." + "-" * bubble_width + "."]
+    lines.extend("| " + pad(line, bubble_width) + " |" for line in words)
+    lines.append(" '" + "-" * bubble_width + "'")
+    lines.append("        /")
+    lines.extend("  " + line for line in clean_art_lines(art))
+    return lines
 
 def print_status(song, artist, progress_s, duration_s, current_line, source, discord_ok, paused=False):
     clear_screen()
-    W        = 52
-    bar_w    = W - 6
-    filled   = int((progress_s / max(duration_s, 1)) * bar_w)
-    bar      = "█" * filled + "░" * (bar_w - filled)
+    W        = 58
+    bar_w    = W - 10
+    ratio    = min(max(progress_s / max(duration_s, 1), 0.0), 1.0)
+    filled   = int(ratio * bar_w)
+    bar      = "#" * filled + "." * (bar_w - filled)
     prog_str = f"{fmt_time(progress_s)} / {fmt_time(duration_s)}"
-    if paused:
-        status = "⏸ Paused"
-    else:
-        status = "✓ Updated" if discord_ok else "✗ Failed"
+    status   = "Paused" if paused else ("Updated" if discord_ok else "Failed")
 
-    div  = "╠" + "═" * W + "╣"
-    song_t   = song[:W - 12]   if song   else ""
-    artist_t = artist[:W - 12] if artist else ""
-    line_t   = current_line[:W - 4] if current_line else "—"
+    song_t   = trim_display(song, W - 12) if song else ""
+    artist_t = trim_display(artist, W - 12) if artist else ""
+    line_t   = trim_display(current_line, W - 4) if current_line else "-"
+    source_t = trim_display(source, W - 12) if source else "-"
 
-    print("╔" + "═" * W + "╗")
-    print(row("🎵  Spotify → Discord Status", W))
-    print(div)
-    print(row(f"Song    {song_t}", W))
-    print(row(f"Artist  {artist_t}", W))
-    print(row("", W))
-    print(row(f"  [{bar}]", W))
-    print(row(f"  {prog_str}", W))
-    print(div)
-    print(row(f"  {line_t}", W))
-    print(div)
-    print(row(f"  Source  {source}", W))
-    print(row(f"  Discord {status}", W))
-    print(div)
-    print(row("  Ctrl+C to stop", W))
-    print("╚" + "═" * W + "╝")
+    gui_lines = [
+        border(W, "="),
+        row("Spotify -> Discord Status", W),
+        border(W),
+        row(f"Song    {song_t}", W),
+        row(f"Artist  {artist_t}", W),
+        row("", W),
+        row(f"[{bar}]", W),
+        row(f"{prog_str}", W),
+        border(W),
+        row(line_t, W),
+        border(W),
+        row(f"Source  {source_t}", W),
+        row(f"Discord {status}", W),
+        border(W),
+        row("Ctrl+C to stop", W),
+        border(W, "="),
+    ]
+
+    listening = bool(song)
+    speech = current_line if listening else ""
+    seed = f"{song}|{artist}"
+    right_lines = pike_panel(seed, speech, listening)
+    max_len = max(len(gui_lines), len(right_lines))
+
+    for i in range(max_len):
+        left = gui_lines[i] if i < len(gui_lines) else " " * (W + 2)
+        right = right_lines[i] if i < len(right_lines) else ""
+        sys.stdout.write(f"{left}   {right}\033[K\n")
+    sys.stdout.write("\033[J")
+    sys.stdout.flush()
+
 
 def main_menu() -> str:
-    clear_screen()
-    W = 36
-    print("╔" + "═" * W + "╗")
-    print(row("🎵  Spotify → Discord Status", W))
-    print("╠" + "═" * W + "╣")
-    print(row("  [1]  Start", W))
-    print(row("  [2]  Settings", W))
-    print(row("  [3]  Exit", W))
-    print("╚" + "═" * W + "╝")
+    sys.stdout.write("\033[H\033[J")
+    sys.stdout.flush()
+    W = 38
+    gui_lines = [
+        border(W, "="),
+        row("Spotify -> Discord Status", W),
+        border(W),
+        row("[1] Start", W),
+        row("[2] Settings", W),
+        row("[3] Exit", W),
+        border(W, "="),
+    ]
+    right_lines = pike_panel("menu", "pick an option!", True)
+    max_len = max(len(gui_lines), len(right_lines))
+    for i in range(max_len):
+        left  = gui_lines[i] if i < len(gui_lines) else " " * (W + 2)
+        right = right_lines[i] if i < len(right_lines) else ""
+        sys.stdout.write(f"{left}   {right}\033[K\n")
+    sys.stdout.write("\033[J")
+    sys.stdout.flush()
     return input("\n  > ").strip()
+
 
 def config_menu() -> dict:
     cfg = load_config()
     while True:
-        clear_screen()
-        W = 52
-        print("╔" + "═" * W + "╗")
-        print(row("⚙   Settings", W))
-        print("╠" + "═" * W + "╣")
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
+        W = 58
+        print(border(W, "="))
+        print(row("Settings", W))
+        print(border(W))
         for i, (key, label) in enumerate(FIELDS, 1):
             val_str = mask(cfg.get(key, ""))
-            print(row(f"  [{i}]  {label}", W))
-            print(row(f"        {val_str}", W))
+            print(row(f"[{i}] {label}", W))
+            print(row(f"    {val_str}", W))
             print(row("", W))
-        print("╠" + "═" * W + "╣")
-        print(row("  [A]  Update all", W))
-        print(row("  [B]  Back", W))
-        print("╚" + "═" * W + "╝")
+        print(border(W))
+        print(row("[A] Update all", W))
+        print(row("[B] Back", W))
+        print(border(W, "="))
         choice = input("\n  > ").strip().upper()
 
         if choice == "B":
@@ -166,13 +393,13 @@ def config_menu() -> dict:
             for key, label in FIELDS:
                 current = cfg.get(key, "")
                 if key == "SPOTIPY_REDIRECT_URI" and not current:
-                    current = "http://127.0.0.1:8888/callback"
+                    current = "http://127.0.0.1:23435/callback"
                 hint = f" [{mask(current)}]" if current else ""
                 val = input(f"  {label}{hint}\n  > ").strip()
                 if val:
                     cfg[key] = val
                 elif not cfg.get(key) and key == "SPOTIPY_REDIRECT_URI":
-                    cfg[key] = "http://127.0.0.1:8888/callback"
+                    cfg[key] = "http://127.0.0.1:23435/callback"
             save_config(cfg)
         elif choice.isdigit() and 1 <= int(choice) <= len(FIELDS):
             key, label = FIELDS[int(choice) - 1]
@@ -190,33 +417,88 @@ def config_menu() -> dict:
             time.sleep(1)
 
     return load_config()
-
-# ── Discord API ──────────────────────────────────────────────────────────────
+# Discord API
 
 _discord_backoff_until = 0.0
+_discord_queue = queue.Queue()
+_discord_thread_started = False
+_discord_thread_lock = threading.Lock()
+_discord_last_status_ok = True
+
+def _discord_worker():
+    global _discord_backoff_until, _discord_last_status_ok
+    last_update = 0.0
+    pending = None
+    
+    while True:
+        try:
+            timeout = None
+            if pending is not None:
+                now = time.monotonic()
+                time_since_last = now - last_update
+                remaining = max(0.0, 1.5 - time_since_last)
+                if now < _discord_backoff_until:
+                    remaining = max(remaining, _discord_backoff_until - now)
+                timeout = max(0.01, remaining)
+                
+            item = _discord_queue.get(timeout=timeout)
+            if item is None: # sentinel to stop
+                break
+            pending = item
+        except queue.Empty:
+            pass
+            
+        if pending is not None:
+            now = time.monotonic()
+            time_since_last = now - last_update
+            if time_since_last >= 1.5 and now >= _discord_backoff_until:
+                token, text, emoji = pending
+                url     = "https://discord.com/api/v9/users/@me/settings"
+                headers = {"Authorization": token, "Content-Type": "application/json"}
+                payload = {"custom_status": {"text": text[:MAX_STATUS_LEN], "emoji_name": emoji} if text else None}
+                try:
+                    resp = requests.patch(url, json=payload, headers=headers, timeout=10)
+                    last_update = time.monotonic()
+                    if resp.status_code == 429:
+                        retry_after = float(resp.json().get("retry_after", 5))
+                        _discord_backoff_until = time.monotonic() + retry_after
+                        _discord_last_status_ok = False
+                        log.warning("Discord 429 in background – backing off %.1fs", retry_after)
+                    elif resp.status_code == 200:
+                        _discord_last_status_ok = True
+                        pending = None
+                    else:
+                        _discord_last_status_ok = False
+                        pending = None
+                except requests.RequestException as exc:
+                    log.warning("Discord API background error: %s", exc)
+                    _discord_last_status_ok = False
+                    _discord_backoff_until = time.monotonic() + 2.0
 
 def set_discord_status(token: str, text: str, emoji: str = "🎵") -> bool:
-    global _discord_backoff_until
-    now = time.monotonic()
-    if now < _discord_backoff_until:
-        log.debug("Discord rate-limited, skipping (%.1fs left)", _discord_backoff_until - now)
-        return False
-    url     = "https://discord.com/api/v9/users/@me/settings"
-    headers = {"Authorization": token, "Content-Type": "application/json"}
-    payload = {"custom_status": {"text": text[:MAX_STATUS_LEN], "emoji_name": emoji}}
-    try:
-        resp = requests.patch(url, json=payload, headers=headers, timeout=10)
-        if resp.status_code == 429:
-            retry_after = float(resp.json().get("retry_after", 5))
-            _discord_backoff_until = time.monotonic() + retry_after
-            log.warning("Discord 429 – backing off %.1fs", retry_after)
-            return False
-        return resp.status_code == 200
-    except requests.RequestException as exc:
-        log.warning("Discord API error: %s", exc)
-        return False
+    global _discord_thread_started
+    with _discord_thread_lock:
+        if not _discord_thread_started:
+            t = threading.Thread(target=_discord_worker, daemon=True)
+            t.start()
+            _discord_thread_started = True
+            
+    while not _discord_queue.empty():
+        try:
+            _discord_queue.get_nowait()
+        except queue.Empty:
+            break
+            
+    _discord_queue.put((token, text, emoji))
+    return _discord_last_status_ok
 
 def clear_discord_status(token: str):
+    while not _discord_queue.empty():
+        try:
+            _discord_queue.get_nowait()
+        except queue.Empty:
+            break
+    _discord_queue.put((token, "", ""))
     url     = "https://discord.com/api/v9/users/@me/settings"
     headers = {"Authorization": token, "Content-Type": "application/json"}
     try:
@@ -251,12 +533,26 @@ def _lrclib_parse_response(data: dict, duration_s: float) -> list[tuple[float, s
     return [(i * time_per, l) for i, l in enumerate(lines)]
 
 def _clean_title(title: str) -> str:
-    title = re.sub(r"\(feat\..*?\)", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\(ft\..*?\)", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\(with.*?\)", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\(remaster.*?\)", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\(.*?version.*?\)", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\[.*?\]", "", title)
+    """Remove Spotify metadata that usually hurts lyric-provider matching."""
+    title = title or ""
+
+    # Drop bracketed tags like "(feat. X)", "[Remastered 2011]", or "(Radio Edit)".
+    junk_words = (
+        r"feat\.?|ft\.?|featuring|with|remaster(?:ed)?|"
+        r"version|edit|mix|mono|stereo|deluxe|bonus|explicit|clean|"
+        r"radio|single|album|live|acoustic|instrumental|sped up|slowed"
+    )
+    title = re.sub(rf"\s*[\(\[].*?(?:{junk_words}).*?[\)\]]", "", title, flags=re.IGNORECASE)
+
+    # Drop suffix tags like "- Remastered 2011" or "– Radio Edit".
+    title = re.sub(rf"\s*[-–—]\s*(?:\d{{4}}\s*)?(?:{junk_words}).*$", "", title, flags=re.IGNORECASE)
+
+    # Drop trailing "feat. X" when Spotify puts it outside parentheses.
+    title = re.sub(r"\s+(?:feat\.?|ft\.?|featuring)\s+.+$", "", title, flags=re.IGNORECASE)
+
+    # Normalize leftover whitespace and empty brackets.
+    title = re.sub(r"\s*[\(\[]\s*[\)\]]", "", title)
+    title = re.sub(r"\s{2,}", " ", title)
     return title.strip()
 
 # ── Primary: syncedlyrics library ────────────────────────────────────────────
@@ -337,7 +633,7 @@ def fetch_lyrics_lrclib(artist: str, title: str, duration_s: float) -> tuple[lis
 
 def fetch_and_cache(track_id: str, artist: str, title: str, duration_s: float):
     with _cache_lock:
-        if track_id in _lyrics_cache:
+        if track_id in _lyrics_cache and _lyrics_cache[track_id][1] != "Fetching...":
             return
 
     # 1) Primary: syncedlyrics (handles multiple providers internally)
@@ -345,7 +641,8 @@ def fetch_and_cache(track_id: str, artist: str, title: str, duration_s: float):
     if result and synced:
         src, raw_lines = "syncedlyrics (synced)", None
     elif result:
-        src, raw_lines = "syncedlyrics (plain)", None
+        src, raw_lines = "syncedlyrics (plain)", [line for _, line in result]
+        result = None
     else:
         # 2) Fallback: direct LrcLib API
         log.info("syncedlyrics miss → falling back to LrcLib: %s – %s", artist, title)
@@ -353,7 +650,8 @@ def fetch_and_cache(track_id: str, artist: str, title: str, duration_s: float):
         if result and synced:
             src, raw_lines = "LrcLib (synced)", None
         elif result:
-            src, raw_lines = "LrcLib (plain)", None
+            src, raw_lines = "LrcLib (plain)", [line for _, line in result]
+            result = None
         else:
             src, raw_lines, result = "None (track name only)", None, None
 
@@ -376,7 +674,7 @@ def detect_mood(timed_lines: list[tuple[float, str]]) -> str:
     return best if scores[best] > 0 else "neutral"
 
 def line_index_at(timed_lines: list[tuple[float, str]], pos_s: float) -> int:
-    idx = 0
+    idx = -1
     for i, (start, _) in enumerate(timed_lines):
         if start <= pos_s:
             idx = i
@@ -398,22 +696,23 @@ def run(cfg: dict):
     required = {"SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "DISCORD_TOKEN"}
     missing  = [label for key, label in FIELDS if key in required and not cfg.get(key)]
     if missing:
-        print(f"\n  ✗ Missing: {', '.join(missing)}")
+        print(f"\n  Missing: {', '.join(missing)}")
         print("    Go to Settings [2] to fill them in.")
         time.sleep(3)
         return
 
-    redirect = cfg.get("SPOTIPY_REDIRECT_URI") or "http://127.0.0.1:8888/callback"
+    redirect = cfg.get("SPOTIPY_REDIRECT_URI") or "http://127.0.0.1:23435/callback"
     try:
         auth = SpotifyOAuth(
             client_id=cfg["SPOTIPY_CLIENT_ID"],
             client_secret=cfg["SPOTIPY_CLIENT_SECRET"],
             redirect_uri=redirect,
-            scope="user-read-currently-playing user-read-playback-state user-read-recently-played",
+            scope="user-read-currently-playing user-read-playback-state",
+            cache_path=os.path.join(get_appdata_dir(), ".cache"),
         )
         sp = spotipy.Spotify(auth_manager=auth)
     except Exception as exc:
-        print(f"\n  ✗ Spotify auth failed: {exc}")
+        print(f"\n  Spotify auth failed: {exc}")
         time.sleep(3)
         return
 
@@ -451,6 +750,8 @@ def run(cfg: dict):
         time_per  = duration_s / len(raw_lines)
         timed     = [(i * time_per, l) for i, l in enumerate(raw_lines)]
         start_idx = line_index_at(timed, pos_s)
+        if start_idx < 0:
+            start_idx = 0
         offset    = pos_s - timed[start_idx][0]
         return [(t + offset, l) for t, l in timed]
 
@@ -466,17 +767,17 @@ def run(cfg: dict):
             log.info("Cache hit: %s – %s", artist_name, track_name)
         else:
             ui_line = "Fetching lyrics..."
-            print(f"  ♫  {track_name} — {artist_name}")
+            print(f"  Now playing: {track_name} - {artist_name}")
             print("  Fetching lyrics...")
+            with _cache_lock:
+                _lyrics_cache[track_id] = (None, "Fetching...", "neutral", None)
             t = threading.Thread(
                 target=fetch_and_cache,
                 args=(track_id, artist_name, track_name, duration_s),
                 daemon=True,
             )
             t.start()
-            t.join(timeout=20)
-            with _cache_lock:
-                result, src, m, raw_lines = _lyrics_cache.get(track_id, (None, "None (track name only)", "neutral", None))
+            result, src, m, raw_lines = None, "Fetching...", "neutral", None
 
         if result is None and raw_lines:
             result = anchor_plain(raw_lines, duration_s, start_pos_s)
@@ -501,13 +802,17 @@ def run(cfg: dict):
             if not upcoming:
                 return
             next_track = upcoming[0]
-            nid     = next_track["id"]
+            nid     = next_track.get("id")
+            if not nid:
+                return
             nname   = next_track["name"]
             nartist = next_track["artists"][0]["name"]
             ndur    = next_track["duration_ms"] / 1000
 
             with _cache_lock:
                 already = nid in _lyrics_cache
+                if not already:
+                    _lyrics_cache[nid] = (None, "Fetching...", "neutral", None)
             if not already:
                 log.info("Prefetching next track: %s – %s", nartist, nname)
                 t = threading.Thread(
@@ -524,15 +829,51 @@ def run(cfg: dict):
             # Freeze position while paused so it doesn't drift forward
             pos_s = anchor_pos_s if is_paused else anchor_pos_s + (time.monotonic() - anchor_time)
 
+            # ── Check if background lyric fetch completed ──
+            if lyrics_source == "Fetching..." and last_track_id is not None:
+                with _cache_lock:
+                    cached = _lyrics_cache.get(last_track_id)
+                if cached and cached[1] != "Fetching...":
+                    result, src, m, raw_lines = cached
+                    if result is None and raw_lines:
+                        result = anchor_plain(raw_lines, ui_duration_s, pos_s)
+                        src    = f"{src} (anchored)"
+                    if not result:
+                        result = []
+                    
+                    timed_lines   = result
+                    lyrics_source = src
+                    mood          = m
+                    plain_raw     = raw_lines
+                    current_idx   = line_index_at(timed_lines, pos_s) if timed_lines else -1
+                    
+                    if timed_lines and current_idx >= 0:
+                        _, line    = timed_lines[current_idx]
+                        ui_line    = line
+                        emoji      = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
+                        discord_ok = set_discord_status(discord_token, line, emoji)
+                        log.info("Loaded background lyrics: line %d: %s", current_idx, line)
+                    elif timed_lines and current_idx == -1:
+                        intro_status = f"🎵 {ui_song} — {ui_artist}"
+                        ui_line      = "Instrumental / Intro"
+                        discord_ok   = set_discord_status(discord_token, intro_status)
+                        log.info("Loaded background lyrics (intro): %s", intro_status)
+                    else:
+                        fallback    = f"{ui_song} — {ui_artist}"
+                        ui_line     = fallback
+                        discord_ok  = set_discord_status(discord_token, fallback)
+                        current_idx = 0
+
             near_end      = ui_duration_s > 0 and pos_s >= ui_duration_s - END_OF_SONG_WINDOW
-            poll_interval = END_OF_SONG_POLL if near_end else random.uniform(10, 15)
+            is_idle       = last_track_id is None or is_paused
+            poll_interval = END_OF_SONG_POLL if (near_end or is_idle) else RESYNC_EVERY
             need_poll     = last_track_id is None or (time.monotonic() - last_resync) >= poll_interval
 
             if need_poll:
                 playback = do_spotify_poll()
 
                 if playback is None:
-                    time.sleep(5)
+                    time.sleep(2)
                     continue
 
                 if not playback or not playback.get("is_playing"):
@@ -543,11 +884,18 @@ def run(cfg: dict):
                             last_track_id = None
                             timed_lines   = []
                             current_idx   = -1
-                            ui_line       = "— nothing playing —"
                             ui_duration_s = 0.0
                             is_paused     = False
-                        clear_screen()
-                        print("  ⏸  Nothing playing. Waiting for next track...")
+                        ui_song       = ""
+                        ui_artist     = ""
+                        ui_line       = "Nothing playing"
+                        lyrics_source = "Idle"
+                        print_status(
+                            song="", artist="",
+                            progress_s=0.0, duration_s=0.0,
+                            current_line=ui_line, source=lyrics_source,
+                            discord_ok=discord_ok, paused=False,
+                        )
                     else:
                         # ── Track exists but is paused — freeze position ──
                         if not is_paused:
@@ -564,7 +912,7 @@ def run(cfg: dict):
                             discord_ok=discord_ok, paused=True,
                         )
                     last_resync = time.monotonic()
-                    time.sleep(END_OF_SONG_POLL)
+                    time.sleep(2)
                     continue
 
                 item        = playback["item"]
@@ -593,23 +941,33 @@ def run(cfg: dict):
                     next_drift_interval = random.uniform(15, 20)
 
                     start_pos_s = progress_ms / 1000
+                    fetch_start_time = time.monotonic()
                     timed_lines, lyrics_source, mood, current_idx, plain_raw = load_new_track(
                         track_id, track_name, artist_name, duration_s, start_pos_s
                     )
+                    time_spent = time.monotonic() - fetch_start_time
+                    anchor_pos_s = start_pos_s + time_spent
+                    anchor_time  = time.monotonic()
+                    pos_s        = anchor_pos_s
 
-                    if timed_lines and current_idx >= 0:
-                        _, line    = timed_lines[current_idx]
-                        ui_line    = line
-                        emoji      = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
-                        discord_ok = set_discord_status(discord_token, line, emoji)
-                        log.info("Started at line %d: %s", current_idx, line)
-                    elif not timed_lines:
+                    if timed_lines:
+                        current_idx = line_index_at(timed_lines, pos_s)
+                        if current_idx >= 0:
+                            _, line    = timed_lines[current_idx]
+                            ui_line    = line
+                            emoji      = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
+                            discord_ok = set_discord_status(discord_token, line, emoji)
+                            log.info("Started at line %d: %s", current_idx, line)
+                        else:
+                            intro_status = f"🎵 {track_name} — {artist_name}"
+                            ui_line      = "Instrumental / Intro"
+                            discord_ok   = set_discord_status(discord_token, intro_status)
+                            log.info("Started in intro: %s", intro_status)
+                    else:
                         fallback    = f"{track_name} — {artist_name}"
                         ui_line     = fallback
                         discord_ok  = set_discord_status(discord_token, fallback)
                         current_idx = 0
-
-                    prefetch_queue()
 
                 else:
                     if plain_raw:
@@ -618,11 +976,16 @@ def run(cfg: dict):
                         new_idx     = line_index_at(timed_lines, real_pos_s)
                         if new_idx != current_idx:
                             current_idx = new_idx
-                            _, line     = timed_lines[current_idx]
-                            ui_line     = line
-                            emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
-                            discord_ok  = set_discord_status(discord_token, line, emoji)
-                            log.info("Plain re-anchored at %.1fs → line %d: %s", real_pos_s, current_idx, line)
+                            if current_idx >= 0:
+                                _, line     = timed_lines[current_idx]
+                                ui_line     = line
+                                emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
+                                discord_ok  = set_discord_status(discord_token, line, emoji)
+                                log.info("Plain re-anchored at %.1fs → line %d: %s", real_pos_s, current_idx, line)
+                            else:
+                                intro_status = f"🎵 {track_name} — {artist_name}"
+                                ui_line      = "Instrumental / Intro"
+                                discord_ok   = set_discord_status(discord_token, intro_status)
 
                 # ── Seek detection ──
                 spotify_pos = progress_ms / 1000
@@ -631,31 +994,48 @@ def run(cfg: dict):
                     new_idx = line_index_at(timed_lines, spotify_pos)
                     if new_idx != current_idx:
                         current_idx = new_idx
-                        _, line     = timed_lines[current_idx]
-                        ui_line     = line
-                        emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
-                        discord_ok  = set_discord_status(discord_token, line, emoji)
-                        log.info("Seek detected: %.1fs → %.1fs, line %d: %s",
-                                 estimated, spotify_pos, current_idx, line)
+                        if current_idx >= 0:
+                            _, line     = timed_lines[current_idx]
+                            ui_line     = line
+                            emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
+                            discord_ok  = set_discord_status(discord_token, line, emoji)
+                            log.info("Seek detected: %.1fs → %.1fs, line %d: %s",
+                                     estimated, spotify_pos, current_idx, line)
+                        else:
+                            intro_status = f"🎵 {ui_song} — {ui_artist}"
+                            ui_line      = "Instrumental / Intro"
+                            discord_ok   = set_discord_status(discord_token, intro_status)
+                            log.info("Seek detected: %.1fs → %.1fs, intro: %s",
+                                     estimated, spotify_pos, intro_status)
 
                 anchor_pos_s = spotify_pos
                 anchor_time  = time.monotonic()
                 last_resync  = time.monotonic()
                 pos_s        = anchor_pos_s
 
+                # Prefetch queue on every successful poll to capture manual changes mid-song,
+                # but skip it during the near-end fast polling window to avoid unnecessary API calls.
+                if not near_end:
+                    prefetch_queue()
+
             # ── Periodic drift correction ──
             if (timed_lines
-                    and current_idx >= 0
+                    and current_idx >= -1
                     and (time.monotonic() - last_drift_check) >= next_drift_interval):
 
                 expected_idx = line_index_at(timed_lines, pos_s)
                 if expected_idx != current_idx:
                     log.info("Drift corrected: line %d → %d at %.1fs", current_idx, expected_idx, pos_s)
                     current_idx = expected_idx
-                    _, line     = timed_lines[current_idx]
-                    ui_line     = line
-                    emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
-                    discord_ok  = set_discord_status(discord_token, line, emoji)
+                    if current_idx >= 0:
+                        _, line     = timed_lines[current_idx]
+                        ui_line     = line
+                        emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
+                        discord_ok  = set_discord_status(discord_token, line, emoji)
+                    else:
+                        intro_status = f"🎵 {ui_song} — {ui_artist}"
+                        ui_line      = "Instrumental / Intro"
+                        discord_ok   = set_discord_status(discord_token, intro_status)
 
                 last_drift_check    = time.monotonic()
                 next_drift_interval = random.uniform(15, 20)
@@ -665,11 +1045,23 @@ def run(cfg: dict):
                 new_idx = line_index_at(timed_lines, pos_s)
                 if new_idx != current_idx:
                     current_idx = new_idx
-                    _, line     = timed_lines[current_idx]
-                    ui_line     = line
-                    emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
-                    discord_ok  = set_discord_status(discord_token, line, emoji)
-                    log.info("Line %d: %s", current_idx, line)
+                    if current_idx >= 0:
+                        _, line     = timed_lines[current_idx]
+                        ui_line     = line
+                        emoji       = random.choice(MOOD_EMOJI.get(mood, MOOD_EMOJI["neutral"]))
+                        discord_ok  = set_discord_status(discord_token, line, emoji)
+                        log.info("Line %d: %s", current_idx, line)
+                    else:
+                        intro_status = f"🎵 {ui_song} — {ui_artist}"
+                        ui_line      = "Instrumental / Intro"
+                        discord_ok   = set_discord_status(discord_token, intro_status)
+                        log.info("Intro/Instrumental: %s", intro_status)
+            else:
+                if ui_song and not is_paused:
+                    progress_str = f"{fmt_time(pos_s)} / {fmt_time(ui_duration_s)}"
+                    status_text  = f"🎵 {ui_song} — {ui_artist} ({progress_str})"
+                    ui_line      = f"{ui_song} — {ui_artist}"
+                    discord_ok   = set_discord_status(discord_token, status_text)
 
             print_status(
                 song         = ui_song,
@@ -679,6 +1071,7 @@ def run(cfg: dict):
                 current_line = ui_line,
                 source       = lyrics_source,
                 discord_ok   = discord_ok,
+                paused       = is_paused,
             )
 
             # ── Calculate sleep until next event ──
@@ -690,6 +1083,13 @@ def run(cfg: dict):
                 if next_line_in > 0:
                     candidates.append(next_line_in)
 
+            # Wake up every 1.0s to check the cache if currently fetching
+            if lyrics_source == "Fetching...":
+                candidates.append(1.0)
+            # Ticking progress for songs without lyrics (at most once every 1.5s via background thread)
+            elif not timed_lines and ui_song and not is_paused:
+                candidates.append(1.5)
+
             next_poll_in  = poll_interval - (time.monotonic() - last_resync)
             next_drift_in = next_drift_interval - (time.monotonic() - last_drift_check)
             candidates.append(max(0.1, next_poll_in))
@@ -697,22 +1097,51 @@ def run(cfg: dict):
 
             sleep_s = min(candidates) if candidates else 2.0
             sleep_s = min(sleep_s, 5.0)  # Cap at 5s to catch manual skips fast
-            if near_end:
+
+            # ── Calculate sleep until next event ──
+            pos_s      = anchor_pos_s if is_paused else anchor_pos_s + (time.monotonic() - anchor_time)
+            candidates = []
+
+            if timed_lines and current_idx + 1 < len(timed_lines):
+                next_line_in = timed_lines[current_idx + 1][0] - pos_s
+                if next_line_in > 0:
+                    candidates.append(next_line_in)
+
+            # Wake up every 1.0s to check the cache if currently fetching
+            if lyrics_source == "Fetching...":
+                candidates.append(1.0)
+            # Ticking progress for songs without lyrics (at most once every 1.5s via background thread)
+            elif not timed_lines and ui_song and not is_paused:
+                candidates.append(1.5)
+
+            next_poll_in  = poll_interval - (time.monotonic() - last_resync)
+            next_drift_in = next_drift_interval - (time.monotonic() - last_drift_check)
+            candidates.append(max(0.1, next_poll_in))
+            candidates.append(max(0.1, next_drift_in))
+
+            sleep_s = min(candidates) if candidates else 2.0
+            sleep_s = min(sleep_s, 5.0)  # Cap at 5s to catch manual skips fast
+            if near_end or is_idle or lyrics_source == "Fetching...":
                 sleep_s = min(sleep_s, END_OF_SONG_POLL)
 
             time.sleep(sleep_s)
 
     except KeyboardInterrupt:
         clear_discord_status(discord_token)
-        clear_screen()
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
         print("  Stopped. Discord status cleared.\n")
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        os.system("")  # enable ANSI codes
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     cfg = load_config()
 
     if not cfg:
-        clear_screen()
-        print("  Welcome! No config found — let's set up your tokens.\n")
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
+        print("  Welcome! No config found. Let's set up your tokens.\n")
         time.sleep(1)
         cfg = config_menu()
 
@@ -724,7 +1153,8 @@ if __name__ == "__main__":
         elif choice == "2":
             cfg = config_menu()
         elif choice == "3":
-            clear_screen()
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.flush()
             print("  Bye!\n")
             sys.exit(0)
         else:
