@@ -14,7 +14,6 @@ Syncs your Spotify playback to your Discord custom status in real time, showing 
 - Prefetches lyrics for the next queued song in the background so track changes are instant
 - Picks an emoji based on the detected mood of the lyrics (happy, sad, angry, romantic, chill, hype, neutral)
 - Renders your current album art as pixel art directly in the terminal using ANSI true colour
-- Features a terminal mascot — the Cunning Pike — with 25 variants that reacts to what's playing
 
 ---
 
