@@ -4,6 +4,15 @@ Syncs your Spotify playback to your Discord custom status in real time, showing 
 
 ---
 
+## Download
+
+**No Python required — just download and run.**
+
+👉 **[Download the latest .exe from Releases](https://github.com/fkelav/Discord-status-changer-to-spotify-lyrics/releases/latest)**
+
+
+---
+
 ## What it does
 
 - Fetches synced lyrics (with real timestamps) so your status updates line by line as the song plays
@@ -19,9 +28,13 @@ Syncs your Spotify playback to your Discord custom status in real time, showing 
 
 ## Requirements
 
-Python 3.10 or newer.
+**Option A — just use the exe** (recommended)
 
-Install dependencies:
+Download the `.exe` from the [Releases page](https://github.com/fkelav/Discord-status-changer-to-spotify-lyrics/releases/latest). No Python, no installs, just run it.
+
+**Option B — run from source**
+
+Python 3.10 or newer, then:
 
 ```
 pip install spotipy requests syncedlyrics Pillow
@@ -29,11 +42,11 @@ pip install spotipy requests syncedlyrics Pillow
 
 > `Pillow` is required for album art rendering. The script will run without it but album art will be disabled.
 
-Or just open the exe
-
 ---
 
 ## Setup
+
+You still need a Spotify app and your Discord token regardless of whether you use the exe or the script.
 
 ### 1. Spotify app
 
@@ -58,11 +71,7 @@ To get your token:
 
 ### 3. First run
 
-Run the script:
-
-```
-python spotify_discord_status.py
-```
+Run the exe (or `python spotify_discord_status.py` from source).
 
 On first launch it will open the Settings menu automatically. Enter your Spotify Client ID, Client Secret, Redirect URI, and Discord token.
 
@@ -86,7 +95,7 @@ On launch you'll see a menu with three options:
 
 | File | Purpose |
 |------|---------|
-| `spotify_discord_status.py` | Main script |
+| `spotify_discord_status.py` | Main script (source only) |
 | `%APPDATA%\SpotifyDiscordStatus\config.json` | Saved tokens (auto-created on first run) |
 | `%APPDATA%\SpotifyDiscordStatus\spotify_discord.log` | Debug log — check this if something isn't working |
 | `%APPDATA%\SpotifyDiscordStatus\.cache` | Spotify OAuth token cache (auto-created by spotipy) |
@@ -116,7 +125,7 @@ The terminal display shows:
 - The lyrics source (syncedlyrics synced/plain, LrcLib, etc.)
 - Discord update status (Updated / Failed / Paused)
 - **Album art** rendered as ANSI pixel art using Unicode half-block characters (`▄`) with true 24-bit colour — requires Pillow
-- The emojy in a speech bubble, speaking the current lyric. The emojy variant is deterministically chosen from 25 options based on the current song, so it stays consistent per track but changes between songs.
+- An emoji in a speech bubble displaying the current lyric, chosen based on the current song.
 
 ---
 
@@ -146,8 +155,8 @@ Delete `%APPDATA%\SpotifyDiscordStatus\.cache` and restart. This forces a fresh 
 Expected if the song wasn't prefetched (e.g. you picked it directly from your library rather than the queue). The script sets `Song — Artist` on Discord immediately and loads lyrics in the background — typically 2–5 seconds depending on your connection.
 
 **Album art not showing**
-Make sure Pillow is installed: `pip install Pillow`. The script logs a warning and disables album art gracefully if it isn't.
+Make sure Pillow is installed: `pip install Pillow`. The exe includes Pillow already — if art isn't showing on the exe, check `spotify_discord.log` for errors.
 
 ---
 
-If you need help @fkelav on discord
+If you need help @fkelav on Discord.
